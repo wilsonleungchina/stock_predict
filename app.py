@@ -86,6 +86,51 @@ _FINANCE_API = 'https://www.codebuddy.cn/v2/tool/financedata'
 _FINANCE_HEADERS = {'Content-Type': 'application/json'}
 
 
+@st.cache_data(ttl=60)
+def get_realtime_quote(stock_code: str) -> dict:
+    """
+    通过新浪实时行情接口获取今日最新报价（收盘价、涨跌幅、成交量等）。
+    用于补充日K线尚未更新今日数据的情况。
+    返回 dict 或 {'error': ...}
+    """
+    url = f'https://hq.sinajs.cn/list={stock_code}'
+    try:
+        r = requests.get(url, headers=_SINA_HEADERS, timeout=10)
+        r.encoding = 'gbk'
+        text = r.text.strip()
+        if '=' not in text or text.count('"') < 2:
+            return {'error': '接口格式异常'}
+        val = text.split('"')[1]
+        fields = val.split(',')
+        # 新浪实时字段（A股）：
+        # 0:名称 1:今日开盘 2:昨日收盘 3:当前价 4:最高 5:最低
+        # 6:买一 7:卖一 8:成交量(股) 9:成交额(元)
+        # 10:买一量 11:买一价 ... 14:卖一量 15:卖一价
+        # 30:日期 31:时间
+        if len(fields) < 32:
+            return {'error': f'字段不足({len(fields)}),数据不完整'}
+        today_date = fields[30]        # '2026-04-17'
+        current   = float(fields[3])   # 当前价
+        open_p    = float(fields[1])   # 开盘价
+        y_close   = float(fields[2])   # 昨收
+        high      = float(fields[4])   # 最高
+        low       = float(fields[5])   # 最低
+        vol       = float(fields[8])   # 成交量
+        pct_chg   = (current - y_close) / y_close * 100 if y_close else 0
+        return {
+            'date':      today_date,
+            'close':     current,
+            'open':      open_p,
+            'prev_close': y_close,
+            'high':      high,
+            'low':       low,
+            'volume':    vol,
+            'pct_chg':   round(pct_chg, 2),
+        }
+    except Exception as e:
+        return {'error': str(e)}
+
+
 @st.cache_data(ttl=3600)
 def get_auxiliary_indicators(stock_code_6: str) -> dict:
     """
@@ -778,6 +823,22 @@ def main():
         except Exception as e:
             st.error(f"❌ 数据获取失败: {e}")
             return
+
+    # ── 补充今日实时数据（日K更新滞后时兜底）───────────────────
+    today_str = pd.Timestamp.now().strftime('%Y-%m-%d')
+    if df.empty or str(df['date'].max().date()) < today_str:
+        rt = get_realtime_quote(user_input)
+        if 'error' not in rt and rt['date'] == today_str:
+            today_row = {
+                'date':   pd.to_datetime(rt['date']),
+                'open':   rt['open'],
+                'close':  rt['close'],
+                'high':   rt['high'],
+                'low':    rt['low'],
+                'volume': rt['volume'],
+            }
+            df = pd.concat([df, pd.DataFrame([today_row])], ignore_index=True)
+            df = df.sort_values('date').reset_index(drop=True)
 
     with st.spinner("正在构建技术指标特征..."):
         df_feat = build_features(df, up_threshold=up_threshold, predict_days=predict_days)
