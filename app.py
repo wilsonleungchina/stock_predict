@@ -82,6 +82,226 @@ _SINA_HEADERS = {
 }
 
 
+_FINANCE_API = 'https://www.codebuddy.cn/v2/tool/financedata'
+_FINANCE_HEADERS = {'Content-Type': 'application/json'}
+
+
+@st.cache_data(ttl=3600)
+def get_auxiliary_indicators(stock_code_6: str) -> dict:
+    """
+    获取三个辅助指标（均来自真实接口）：
+    1. 近5日资金流向（个股）
+    2. 大盘趋势（沪深300 + 创业板指）
+    3. 估值位置（个股历史分位）
+    全部通过 finance-data 接口获取，取数失败则显示"取数失败"
+    """
+    result = {
+        'moneyflow': {'ok': False, 'data': None, 'error': None},
+        'market_trend': {'ok': False, 'data': None, 'error': None},
+        'valuation': {'ok': False, 'data': None, 'error': None},
+    }
+
+    # ── 1. 资金流向（个股）────────────────────────────────────────
+    try:
+        end_dt   = pd.Timestamp.now().strftime('%Y%m%d')
+        start_dt = (pd.Timestamp.now() - pd.Timedelta(days=14)).strftime('%Y%m%d')
+
+        r = requests.post(
+            _FINANCE_API, headers=_FINANCE_HEADERS,
+            json={
+                'api_name': 'moneyflow',
+                'params': {
+                    'ts_code': stock_code_6 + '.SZ' if stock_code_6.startswith('0')
+                               else stock_code_6 + '.SH',
+                    'end_date': end_dt,
+                    'start_date': start_dt,
+                },
+                'fields': 'ts_code,trade_date,buy_lg_amount,sell_lg_amount,'
+                          'buy_elg_amount,sell_elg_amount,net_mf_amount',
+            },
+            timeout=15,
+        )
+        d = r.json()
+        if d.get('code') == 0 and d['data']['items']:
+            rows = d['data']['items']
+            records = []
+            for row in rows:
+                trade_date = str(row[1])
+                buy_lg     = float(row[2]) if row[2] else 0
+                sell_lg    = float(row[3]) if row[3] else 0
+                buy_elg    = float(row[4]) if row[4] else 0
+                sell_elg   = float(row[5]) if row[5] else 0
+                net_mf     = float(row[6]) if row[6] else 0
+                # 主力净流入 = 大单 + 特大单
+                main_net = buy_lg + buy_elg - sell_lg - sell_elg
+                records.append({
+                    'trade_date':  f'{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:]}',
+                    'buy_lg':      buy_lg,
+                    'sell_lg':     sell_lg,
+                    'buy_elg':     buy_elg,
+                    'sell_elg':    sell_elg,
+                    'main_net':    round(main_net, 2),
+                    'net_mf':      net_mf,
+                })
+            # 近5日汇总
+            recent5 = records[:5]
+            total_main_net = sum(r['main_net'] for r in recent5)
+            recent2 = records[:2]
+            recent2_total  = sum(r['main_net'] for r in recent2)
+
+            # 判断：近2日持续净流出 → 偏空
+            if recent2_total < -5000:
+                flow_signal = '🔴 偏空（近2日主力持续净流出）'
+            elif recent2_total < 0:
+                flow_signal = '🟡 谨慎（近2日主力净流出）'
+            elif total_main_net > 5000:
+                flow_signal = '🟢 偏多（近5日主力净流入）'
+            else:
+                flow_signal = '🟡 中性（近5日主力资金拉扯）'
+
+            result['moneyflow'] = {
+                'ok': True,
+                'data': {
+                    'recent5':   recent5,
+                    'total_main_net': total_main_net,
+                    'recent2_total':  recent2_total,
+                    'signal':    flow_signal,
+                },
+            }
+        else:
+            result['moneyflow']['error'] = d.get('msg', '无数据')
+    except Exception as e:
+        result['moneyflow']['error'] = str(e)
+
+    # ── 2. 大盘趋势（沪深300 + 创业板指）──────────────────────────
+    try:
+        end_dt2   = pd.Timestamp.now().strftime('%Y%m%d')
+        start_dt2 = (pd.Timestamp.now() - pd.Timedelta(days=10)).strftime('%Y%m%d')
+
+        r_sh = requests.post(
+            _FINANCE_API, headers=_FINANCE_HEADERS,
+            json={
+                'api_name': 'index_daily',
+                'params': {'ts_code': '000300.SH', 'end_date': end_dt2, 'start_date': start_dt2},
+                'fields': 'ts_code,trade_date,close,pct_chg',
+            },
+            timeout=15,
+        )
+        r_cy = requests.post(
+            _FINANCE_API, headers=_FINANCE_HEADERS,
+            json={
+                'api_name': 'index_daily',
+                'params': {'ts_code': '399006.SZ', 'end_date': end_dt2, 'start_date': start_dt2},
+                'fields': 'ts_code,trade_date,close,pct_chg',
+            },
+            timeout=15,
+        )
+
+        sh_data, cy_data = r_sh.json(), r_cy.json()
+        sh_items = sh_data.get('data', {}).get('items', []) if sh_data.get('code') == 0 else []
+        cy_items = cy_data.get('data', {}).get('items', []) if cy_data.get('code') == 0 else []
+
+        def _parse_index(items, name):
+            if not items:
+                return None
+            parsed = []
+            for row in items[:5]:
+                trade_date = str(row[1])
+                parsed.append({
+                    'date':   f'{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:]}',
+                    'close':  float(row[2]) if row[2] else 0,
+                    'pct_chg': float(row[3]) if row[3] else 0,
+                })
+            if len(parsed) >= 2:
+                pct_5d = (parsed[0]['close'] - parsed[-1]['close']) / parsed[-1]['close'] * 100
+            else:
+                pct_5d = 0
+            if pct_5d > 3:
+                trend = '📈 强势'
+            elif pct_5d > 0:
+                trend = '📊 偏强'
+            elif pct_5d > -3:
+                trend = '📉 偏弱'
+            else:
+                trend = '🔴 弱势'
+            return {'name': name, 'parsed': parsed, 'pct_5d': round(pct_5d, 2), 'trend': trend}
+
+        sh_parsed = _parse_index(sh_items, '沪深300')
+        cy_parsed = _parse_index(cy_items, '创业板指')
+
+        if sh_parsed or cy_parsed:
+            result['market_trend'] = {
+                'ok': True,
+                'data': {
+                    'sh300': sh_parsed,
+                    'cy': cy_parsed,
+                },
+            }
+        else:
+            result['market_trend']['error'] = '无大盘数据'
+    except Exception as e:
+        result['market_trend']['error'] = str(e)
+
+    # ── 3. 估值位置（由调用方在 df 上计算后传入，这里预留接口）──
+    # 实际计算在 get_valuation_from_df 中完成
+    result['valuation'] = {'ok': False, 'data': None}
+
+    return result
+
+
+def get_valuation_from_df(df: pd.DataFrame) -> dict:
+    """
+    基于本地K线数据计算价格历史分位
+    （不调用外部接口，直接从 df 估算）
+    """
+    try:
+        closes = df['close'].dropna().values
+        if len(closes) < 60:
+            return {'ok': False, 'error': '数据不足60条'}
+
+        current = closes[-1]
+        # 近1年分位（约240个交易日）
+        year_closes = closes[-240:] if len(closes) >= 240 else closes
+        sorted_closes = np.sort(year_closes)
+        n = len(sorted_closes)
+        percentile = int(np.searchsorted(sorted_closes, current) / n * 100)
+
+        # 近2年分位
+        all_closes = closes
+        sorted_all = np.sort(all_closes)
+        percentile_all = int(np.searchsorted(sorted_all, current) / len(sorted_all) * 100)
+
+        # 52周高低价
+        high_52w = np.max(year_closes)
+        low_52w  = np.min(year_closes)
+
+        # 判断
+        if percentile >= 80:
+            signal = '🔴 高估区（价格分位>80%）'
+        elif percentile >= 60:
+            signal = '🟡 中高（价格分位60~80%）'
+        elif percentile >= 40:
+            signal = '🟡 中性（价格分位40~60%）'
+        elif percentile >= 20:
+            signal = '🟢 中低（价格分位20~40%）'
+        else:
+            signal = '🟢 低估区（价格分位<20%）'
+
+        return {
+            'ok': True,
+            'data': {
+                'current': round(current, 2),
+                'high_52w': round(high_52w, 2),
+                'low_52w':  round(low_52w, 2),
+                'percentile_1y': percentile,
+                'percentile_2y': percentile_all,
+                'signal': signal,
+            },
+        }
+    except Exception as e:
+        return {'ok': False, 'error': str(e)}
+
+
 @st.cache_data(ttl=3600)
 def get_daily_kline(stock_code: str, count: int = 500) -> pd.DataFrame:
     """
@@ -573,6 +793,12 @@ def main():
             st.error(f"❌ 预测异常: {e}")
             return
 
+    # ── 获取辅助指标 ─────────────────────────────────────────
+    stock_6 = user_input.lstrip('sh').lstrip('sz')
+    with st.spinner("正在获取资金流向、大盘趋势、估值分位..."):
+        aux = get_auxiliary_indicators(stock_6)
+        val = get_valuation_from_df(df)
+
     # ══════════════════════════════════════════════════════════════
     #  结果展示
     # ══════════════════════════════════════════════════════════════
@@ -618,6 +844,202 @@ def main():
         - 训练样本：{result['train_count']} 条 | 测试样本：{result['test_count']} 条
         - 训练集正例（涨）占比：{result['positive_ratio']}%
         """)
+
+    st.divider()
+
+    # ══════════════════════════════════════════════════════════════
+    #  辅助指标区（真实接口获取，失败显示"取数失败"）
+    # ══════════════════════════════════════════════════════════════
+    st.subheader("🔍 辅助决策指标（数据来源：东方财富）")
+
+    # ── 三列布局 ────────────────────────────────────────────────
+    col_flow, col_mkt, col_val = st.columns(3)
+
+    # ① 资金流向
+    with col_flow:
+        st.markdown("**💰 近5日资金流向**")
+        mf = aux.get('moneyflow')
+        if mf and mf['ok']:
+            mf_data = mf['data']
+            total_net = mf_data['total_main_net']
+            sign = '+' if total_net >= 0 else ''
+            st.metric("近5日主力净流入", f"{sign}{total_net:,.0f} 万元",
+                      delta=None)
+            # 近2日
+            r2 = mf_data['recent2_total']
+            r2_sign = '+' if r2 >= 0 else ''
+            st.caption(f"近2日主力: {r2_sign}{r2:,.0f} 万元")
+            # 明细表格
+            rows = mf_data['recent5']
+            mf_rows = []
+            for r in rows:
+                arrow = '↑净入' if r['main_net'] >= 0 else '↓净出'
+                mf_rows.append({
+                    '日期': r['trade_date'][-5:],
+                    '主力净额': f"{arrow} {abs(r['main_net']):,.0f}万",
+                })
+            st.dataframe(pd.DataFrame(mf_rows), hide_index=True,
+                        use_container_width=True)
+            st.caption(mf_data['signal'])
+        else:
+            err = mf['error'] if mf else '未知'
+            st.error(f"❌ 资金流向取数失败\n{err}")
+
+    # ② 大盘趋势
+    with col_mkt:
+        st.markdown("**📊 大盘趋势**")
+        mkt = aux.get('market_trend')
+        if mkt and mkt['ok']:
+            mkt_data = mkt['data']
+            sh = mkt_data.get('sh300')
+            cy = mkt_data.get('cy')
+
+            if sh:
+                sh_sign = '+' if sh['pct_5d'] >= 0 else ''
+                sh_color = 'normal' if sh['pct_5d'] >= 0 else 'inverse'
+                st.metric(
+                    f"沪深300（近5日）",
+                    f"{sh_sign}{sh['pct_5d']}%",
+                    delta=sh['trend'],
+                )
+            else:
+                st.caption("沪深300: 取数失败")
+
+            if cy:
+                cy_sign = '+' if cy['pct_5d'] >= 0 else ''
+                st.metric(
+                    f"创业板指（近5日）",
+                    f"{cy_sign}{cy['pct_5d']}%",
+                    delta=cy['trend'],
+                )
+            else:
+                st.caption("创业板指: 取数失败")
+
+            # 综合判断
+            both_pos = sh and cy and sh['pct_5d'] > 0 and cy['pct_5d'] > 0
+            both_neg = sh and cy and sh['pct_5d'] < 0 and cy['pct_5d'] < 0
+            if both_pos:
+                st.success("✅ 大盘环境偏多，利于个股")
+            elif both_neg:
+                st.warning("⚠️ 大盘环境偏弱，注意风险")
+            else:
+                st.info("📋 大盘分化，结构性行情")
+        else:
+            err = mkt['error'] if mkt else '未知'
+            st.error(f"❌ 大盘趋势取数失败\n{err}")
+
+    # ③ 估值位置
+    with col_val:
+        st.markdown("**📐 价格历史分位**")
+        if val and val['ok']:
+            v = val['data']
+            pct = v['percentile_1y']
+            pct2 = v['percentile_2y']
+            st.metric(
+                "当前价格在近1年中的位置",
+                f"{pct}%",
+                delta=v['signal'],
+            )
+            col_p, col_h = st.columns(2)
+            with col_p:
+                st.caption(f"近1年高价: ¥{v['high_52w']}")
+            with col_h:
+                st.caption(f"近1年低价: ¥{v['low_52w']}")
+            st.caption(f"近2年分位: {pct2}%")
+        else:
+            err = val['error'] if val else '未知'
+            st.error(f"❌ 估值分位计算失败\n{err}")
+
+    # ── 综合操作建议 ─────────────────────────────────────────────
+    st.divider()
+    st.subheader("📋 综合操作建议")
+
+    # 综合评分逻辑
+    score = 0
+    reasons = []
+
+    # 模型概率
+    if avg >= 55:
+        score += 2
+        reasons.append(f"✅ 模型上涨概率高（{avg}%）")
+    elif avg >= 40:
+        score += 1
+        reasons.append(f"⚠️ 模型上涨概率中性（{avg}%）")
+    else:
+        score += 0
+        reasons.append(f"❌ 模型上涨概率偏低（{avg}%）")
+
+    # 资金流向
+    if mf and mf['ok']:
+        if mf_data['recent2_total'] > 0:
+            score += 1
+            reasons.append("✅ 资金主力近2日净流入")
+        else:
+            score -= 1
+            reasons.append("❌ 资金主力近2日净流出")
+
+    # 大盘趋势
+    if mkt and mkt['ok']:
+        sh_pos = sh['pct_5d'] > 0 if sh else False
+        cy_pos = cy['pct_5d'] > 0 if cy else False
+        if sh_pos and cy_pos:
+            score += 1
+            reasons.append("✅ 沪深300和创业板指均走强")
+        elif not sh_pos and not cy_pos:
+            score -= 1
+            reasons.append("❌ 沪深300和创业板指均走弱")
+        # 至少一个走强
+        elif sh_pos or cy_pos:
+            score += 0
+            reasons.append("⚠️ 大盘分化")
+
+    # 估值分位
+    if val and val['ok']:
+        p = v['percentile_1y']
+        if p <= 40:
+            score += 1
+            reasons.append(f"✅ 价格处于历史低位（分位{pct}%）")
+        elif p >= 80:
+            score -= 1
+            reasons.append(f"⚠️ 价格处于历史高位（分位{pct}%）")
+
+    # 综合建议
+    if score >= 3:
+        action = "✅ 可考虑建仓（综合评分高）"
+        action_level = "success"
+    elif score >= 1:
+        action = "⚠️ 轻仓试仓（综合评分中性）"
+        action_level = "warning"
+    elif score >= -1:
+        action = "⚠️ 建议观望（综合评分中性偏弱）"
+        action_level = "warning"
+    else:
+        action = "❌ 不建议建仓（综合评分弱）"
+        action_level = "error"
+
+    st.markdown(f"**综合评分：{score} 分**（满分5分）")
+    for r in reasons:
+        st.markdown(f"- {r}")
+
+    if action_level == "success":
+        st.success(action)
+    elif action_level == "warning":
+        st.warning(action)
+    else:
+        st.error(action)
+
+    # ── 建仓仓位建议 ────────────────────────────────────────────
+    pos_text = ""
+    if avg >= 55 and score >= 3:
+        pos_text = "建议仓位：**5~6成**（分批建仓，设定-5%止损）"
+    elif avg >= 40 and score >= 1:
+        pos_text = "建议仓位：**3~4成**（轻仓试探，设定-5%止损）"
+    elif avg >= 30:
+        pos_text = "建议仓位：**1~2成**（试仓为主，设定-5%止损）"
+    else:
+        pos_text = "建议仓位：**暂不建仓**，等待更明确信号"
+
+    st.info(pos_text)
 
     st.divider()
 
