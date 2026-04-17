@@ -9,6 +9,7 @@
 依赖：pip install -r requirements.txt
 """
 
+import os
 import sys
 import io
 import json
@@ -84,6 +85,82 @@ _SINA_HEADERS = {
 
 _FINANCE_API = 'https://www.codebuddy.cn/v2/tool/financedata'
 _FINANCE_HEADERS = {'Content-Type': 'application/json'}
+
+# ══════════════════════════════════════════════════════════════════
+#  matplotlib 中文字体配置（嵌入 TTF，兼容 Streamlit Cloud）
+# ══════════════════════════════════════════════════════════════════
+
+def _setup_cjk_font():
+    """下载并注册 Noto Sans SC 中文字体（只执行一次）"""
+    if not PLT_OK:
+        return
+    import matplotlib
+    import matplotlib.font_manager as fm
+    import tempfile
+
+    def _apply_font(font_name: str):
+        matplotlib.rcParams['font.sans-serif'] = [font_name, 'DejaVu Sans', 'Arial']
+        matplotlib.rcParams['axes.unicode_minus'] = False
+
+    # 检查是否已有注册
+    existing = {f.name for f in fm.fontManager.ttflist}
+    cjk_candidates = ['Noto Sans CJK SC', 'NotoSansSC', 'WenQuanYi Micro Hei',
+                      'SimHei', 'Microsoft YaHei']
+    for cn in cjk_candidates:
+        if cn in existing:
+            _apply_font(cn)
+            return
+
+    # 下载 Noto Sans SC 字体（存 temp 目录）
+    font_tmp = os.path.join(tempfile.gettempdir(), 'NotoSansSC-Regular.otf')
+    if not os.path.exists(font_tmp):
+        try:
+            r = requests.get(
+                'https://github.com/googlefonts/noto-cjk/raw/main/Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf',
+                timeout=30, stream=True,
+            )
+            if r.status_code == 200:
+                with open(font_tmp, 'wb') as f:
+                    for chunk in r.iter_content(chunk_size=65536):
+                        if chunk:
+                            f.write(chunk)
+        except Exception:
+            pass
+
+    if os.path.exists(font_tmp):
+        try:
+            fm.fontManager.addfont(font_tmp)
+            prop = fm.FontProperties(fname=font_tmp)
+            _apply_font(prop.get_name())
+            return
+        except Exception:
+            pass
+
+    # 最终兜底
+    _apply_font('DejaVu Sans')
+
+
+_setup_cjk_font()
+
+
+@st.cache_data(ttl=300)
+def get_stock_name(stock_code: str) -> str:
+    """
+    通过新浪实时接口获取股票中文名称（缓存5分钟）。
+    stock_code 格式如 'sz002837' 或 'sh600519'
+    """
+    url = f'https://hq.sinajs.cn/list={stock_code}'
+    try:
+        r = requests.get(url, headers=_SINA_HEADERS, timeout=8)
+        r.encoding = 'gbk'
+        text = r.text.strip()
+        if '"' in text:
+            name = text.split('"')[1].split(',')[0]
+            if name and len(name) >= 2:
+                return name
+    except Exception:
+        pass
+    return stock_code  # 兜底：取不到就返回代码
 
 
 @st.cache_data(ttl=60)
@@ -808,7 +885,7 @@ def main():
         else:
             user_input = 'sz' + user_input
 
-    stock_name = _COMMON_STOCKS.get(user_input, user_input)
+    stock_name = get_stock_name(user_input)
 
     # ── 依赖检查 ───────────────────────────────────────────────
     if not _deps_ok:
