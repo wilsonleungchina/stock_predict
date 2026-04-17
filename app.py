@@ -884,6 +884,7 @@ def main():
         else:
             err = mf['error'] if mf else '未知'
             st.error(f"❌ 资金流向取数失败\n{err}")
+            st.caption("注：资金流向数据为T+1更新，4月17日数据需4月18日查询")
 
     # ② 大盘趋势
     with col_mkt:
